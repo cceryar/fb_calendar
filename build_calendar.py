@@ -18,8 +18,14 @@ import re
 import sys
 from zoneinfo import ZoneInfo
 
-import requests
 from bs4 import BeautifulSoup
+
+try:  # pretends to be a real Chrome browser, which many sports sites require
+    from curl_cffi import requests as _http
+    _EXTRA = {"impersonate": "chrome"}
+except ImportError:
+    import requests as _http
+    _EXTRA = {}
 
 # ---------------- settings you can change ----------------
 TEAM = "Fenerbahçe"
@@ -44,6 +50,28 @@ HEADERS = {
 }
 HOME_MARKS = {"H", "E", "İ", "I", "EV", "HOME"}
 AWAY_MARKS = {"A", "D", "DEP", "AWAY"}
+
+
+def fetch(url, want_json=False):
+    """Download a page; print what went wrong so failures are visible in the log."""
+    h = dict(HEADERS)
+    if want_json:
+        h["Accept"] = "application/json"
+    try:
+        r = _http.get(url, headers=h, timeout=30, **_EXTRA)
+    except Exception as ex:
+        print(f"  ! {url} -> connection error: {ex}")
+        return None
+    if r.status_code != 200:
+        print(f"  ! {url} -> HTTP {r.status_code}: {r.text[:150]!r}")
+        return None
+    if want_json:
+        try:
+            return r.json()
+        except Exception:
+            print(f"  ! {url} -> not JSON: {r.text[:150]!r}")
+            return None
+    return r.text
 
 
 def parse_date(s):
@@ -81,9 +109,13 @@ def weekend_saturday(d):
 
 # ---------------- Transfermarkt ----------------
 def from_transfermarkt():
-    r = requests.get(TM_URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    html = fetch(TM_URL)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else "?"
+    print(f"  Transfermarkt page: {title!r}, {len(soup.select('div.box'))} boxes, "
+          f"{len(soup.select('table'))} tables")
     matches = []
     for box in soup.select("div.box"):
         head = box.select_one("h2")
@@ -136,9 +168,8 @@ def from_espn():
         for fixture in ("true", "false"):
             url = (f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}"
                    f"/teams/{ESPN_TEAM_ID}/schedule?fixture={fixture}")
-            try:
-                data = requests.get(url, headers=HEADERS, timeout=30).json()
-            except Exception:
+            data = fetch(url, want_json=True)
+            if not data:
                 continue
             for ev in data.get("events", []):
                 c = (ev.get("competitions") or [{}])[0]
@@ -168,9 +199,8 @@ def from_sofascore():
     out, now = {}, dt.datetime.now(dt.timezone.utc)
     for path in ("next/0", "next/1", "last/0"):
         url = f"https://api.sofascore.com/api/v1/team/{SOFASCORE_TEAM_ID}/events/{path}"
-        try:
-            data = requests.get(url, headers=HEADERS, timeout=30).json()
-        except Exception:
+        data = fetch(url, want_json=True)
+        if not data:
             continue
         for ev in data.get("events", []):
             when = dt.datetime.fromtimestamp(ev["startTimestamp"], dt.timezone.utc)
@@ -220,7 +250,7 @@ def merge(*sources):
 
 # ---------------- ICS ----------------
 def esc(s):
-    return s.replace("\\", "\\\\").replace(";", "\;").replace(",", "\\,").replace("\n", "\\n")
+    return s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
 def fold(line):
